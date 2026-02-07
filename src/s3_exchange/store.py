@@ -6,9 +6,15 @@ import os
 import re
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Any, Callable, Literal
+from typing import TYPE_CHECKING, Any, Callable, Literal
 
+from botocore.client import BaseClient
 from botocore.response import StreamingBody
+
+from s3_exchange.settings import S3Settings
+
+if TYPE_CHECKING:
+    import boto3
 
 from .exceptions import (
     MissingPlaceholderError,
@@ -121,8 +127,8 @@ class S3ExchangeStore:
 
     def __init__(
         self,
-        s3_client: Any,
-        bucket: str,
+        s3_client_or_settings: BaseClient | S3Settings,
+        bucket: str | None = None,
         *,
         base_prefix: str = "",
         default_vars: dict[str, Any] | None = None,
@@ -133,9 +139,9 @@ class S3ExchangeStore:
         Parameters
         ----------
         s3_client : Any
-            Boto3 S3 client (configured for Garage endpoint/path-style).
-        bucket : str
-            Target S3 bucket name.
+            Boto3 S3 client (configured for Garage endpoint/path-style) or S3Settings instance to generate the client automatically.
+        bucket : str | None, optional
+            Target S3 bucket name. If not provided, the bucket will be inferred from the S3Settings instance.
         base_prefix : str, optional
             Optional prefix applied to all keys. Defaults to "".
         default_vars : dict[str, Any] | None, optional
@@ -143,8 +149,18 @@ class S3ExchangeStore:
         infer_id : Callable[[str], str] | None, optional
             Function to infer ID from key if missing (default: basename without extension).
         """
-        self.s3_client = s3_client
-        self.bucket = bucket
+
+        if isinstance(s3_client_or_settings, S3Settings):
+            s3_client = s3_client_or_settings.create_client()
+            if bucket is None:
+                bucket = s3_client_or_settings.bucket
+        elif not isinstance(s3_client_or_settings, BaseClient):
+            raise ValueError("s3_client must be a boto3.client or S3Settings instance")
+        else:
+            s3_client = s3_client_or_settings
+
+        self.s3_client: BaseClient = s3_client
+        self.bucket = bucket or "default-bucket"
         self.base_prefix = base_prefix
         self.default_vars = default_vars or {}
         self.infer_id = infer_id or (lambda k: infer_id_from_key(k, remove_extension=True))
