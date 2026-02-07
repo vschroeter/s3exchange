@@ -1,4 +1,8 @@
-"""Shard archive reading, writing, and internal manifest handling."""
+"""Shard class - archive reading, writing, member access, and lifecycle.
+
+Every shard-related operation lives here.  :class:`ArchiveMemberBody` provides
+a StreamingBody-compatible wrapper for archive members.
+"""
 
 from __future__ import annotations
 
@@ -9,16 +13,10 @@ import tarfile
 import tempfile
 from collections.abc import Iterable, Iterator, Sequence
 from pathlib import Path
-from typing import Any
-
-from botocore.response import StreamingBody
+from typing import TYPE_CHECKING, Any
 
 from .exceptions import InvalidManifestError, ObjectNotFoundError, ShardReadError
-from .manifest import (
-    iter_manifest_lines,
-    parse_manifest_line,
-    serialize_manifest_entry,
-)
+from .manifest import Manifest
 from .types import (
     FileEntry,
     ManifestEntry,
@@ -27,21 +25,30 @@ from .types import (
     StreamingBodyLike,
 )
 
+if TYPE_CHECKING:
+    from botocore.response import StreamingBody
+
+    from .store import S3ExchangeStore
+
+
+# ------------------------------------------------------------------ #
+#  StreamingBody-compatible wrapper                                   #
+# ------------------------------------------------------------------ #
+
 
 class ArchiveMemberBody:
     """StreamingBody-compatible wrapper for archive member file-like objects."""
 
     def __init__(self, fileobj: Any, archive_stream: Any | None = None) -> None:
-        """Initialize archive member body.
+        """Initialise archive member body.
 
         Parameters
         ----------
         fileobj : Any
-            File-like object from tarfile.extractfile()
+            File-like object (e.g. ``io.BytesIO``).
         archive_stream : Any | None
-            Optional reference to archive stream (for cleanup)
+            Optional reference kept for cleanup.
         """
-
         self._fileobj = fileobj
         self._archive_stream = archive_stream
 
@@ -50,35 +57,33 @@ class ArchiveMemberBody:
 
         Parameters
         ----------
-        amt : int | None, optional
-            Number of bytes to read. If None, read all remaining bytes.
+        amt : int | None
+            Bytes to read.  *None* means read everything.
 
         Returns
         -------
         bytes
-            Read bytes from the archive member.
         """
         if amt is None:
             return self._fileobj.read()
         return self._fileobj.read(amt)
 
     def close(self) -> None:
-        """Close the archive member."""
+        """Close the underlying file object."""
         if self._fileobj:
             self._fileobj.close()
 
     def iter_lines(self, chunk_size: int | None = None) -> Iterator[bytes]:
-        """Iterate over lines in the archive member.
+        """Iterate over lines.
 
         Parameters
         ----------
-        chunk_size : int | None, optional
-            Size of chunks to read. Defaults to 8192.
+        chunk_size : int | None
+            Read chunk size.  Defaults to 8192.
 
         Yields
         ------
         bytes
-            Lines from the archive member.
         """
         if chunk_size is None:
             chunk_size = 8192
@@ -100,12 +105,11 @@ class ArchiveMemberBody:
         Parameters
         ----------
         b : bytearray
-            Buffer to read into.
+            Target buffer.
 
         Returns
         -------
         int | None
-            Number of bytes read, or None if no data available.
         """
         data = self.read(len(b))
         if not data:
@@ -120,434 +124,516 @@ class ArchiveMemberBody:
         self.close()
 
 
-def read_shard_internal_manifest(
-    archive_stream: StreamingBody,
-    internal_manifest_path: str = "__manifest__.jsonl",
-    format: str = "tar",
-    compression: str | None = "gzip",
-    archive_key: str | None = None,
-) -> list[FileEntry]:
-    """Read the internal manifest from a shard archive.
+# ------------------------------------------------------------------ #
+#  Shard class                                                        #
+# ------------------------------------------------------------------ #
 
-    Parameters
-    ----------
-    archive_stream : StreamingBody
-        StreamingBody of the archive. Will be read completely into memory.
-    internal_manifest_path : str, optional
-        Path to internal manifest inside archive. Defaults to "__manifest__.jsonl".
-    format : str, optional
-        Archive format. Defaults to "tar".
-    compression : str | None, optional
-        Compression type ("gzip", None, etc.). Defaults to "gzip".
-    archive_key : str | None, optional
-        Archive key for generating virtual keys if entries are missing 'key' attribute.
-        Used for backward compatibility with old shards.
 
-    Returns
-    -------
-    list[FileEntry]
-        List of file entries from internal manifest.
+class Shard:
+    """A shard archive stored in S3.
 
-    Raises
-    ------
-    ShardReadError
-        If archive is corrupt or manifest is missing.
+    A shard is a tar archive containing data files plus an internal
+    ``__manifest__.jsonl`` describing them.
+
+    Create instances via the factories or through the store::
+
+        shard = Shard.from_key(store, "data/shards/shard-000001.tar.gz")
+        shard = Shard.from_entry(store, shard_entry_dict)
+        shard = store.get_shard("data/shards/shard-000001.tar.gz")
+
+    The archive bytes are lazily downloaded and cached so that repeated
+    calls to :meth:`get_manifest`, :meth:`iter_entries`, etc. do **not**
+    trigger additional S3 downloads.
     """
-    # Read entire archive into memory to avoid streaming issues
-    try:
-        archive_data = archive_stream.read()
-    except Exception as e:
-        raise ShardReadError(f"Failed to read archive stream: {e}") from e
-    finally:
-        archive_stream.close()
 
-    # Create BytesIO buffer from archive data
-    archive_buffer = io.BytesIO(archive_data)
+    # ------------------------------------------------------------------ #
+    #  Construction                                                       #
+    # ------------------------------------------------------------------ #
 
-    # Determine tar mode
-    mode = "r:"
-    if compression == "gzip":
-        mode += "gz"
-    elif compression:
-        mode += compression
-    else:
-        mode += ""
+    def __init__(
+        self,
+        store: S3ExchangeStore,
+        entry: ShardEntry,
+    ) -> None:
+        """Initialise a Shard.
 
-    try:
-        # Open tar stream from buffer
-        with tarfile.open(fileobj=archive_buffer, mode=mode) as tar:
-            # Find and read internal manifest
+        Parameters
+        ----------
+        store : S3ExchangeStore
+            Parent store.
+        entry : ShardEntry
+            Shard metadata dict.
+        """
+        self._store = store
+        self._entry = entry
+        self._cached_archive_data: bytes | None = None
+
+    @classmethod
+    def from_key(cls, store: S3ExchangeStore, key: str) -> Shard:
+        """Create a Shard from an S3 archive key (format inferred from extension)."""
+        fmt, compression = Shard.infer_archive_format(key)
+        entry = ShardEntry(
+            kind="shard",
+            archive_key=key,
+            format=fmt,
+            compression=compression,
+        )
+        return cls(store, entry)
+
+    @classmethod
+    def from_entry(cls, store: S3ExchangeStore, entry: ShardEntry) -> Shard:
+        """Create a Shard from an existing :class:`ShardEntry` dict."""
+        return cls(store, entry)
+
+    # ------------------------------------------------------------------ #
+    #  Properties                                                         #
+    # ------------------------------------------------------------------ #
+
+    @property
+    def archive_key(self) -> str:
+        """S3 key of the archive."""
+        return self._entry["archive_key"]
+
+    @property
+    def format(self) -> str:
+        """Archive format (currently always ``"tar"``)."""
+        return self._entry.get("format", "tar")
+
+    @property
+    def compression(self) -> str | None:
+        """Compression algorithm (``"gzip"``, ``None``, …)."""
+        return self._entry.get("compression", "gzip")
+
+    @property
+    def internal_manifest_path(self) -> str:
+        """Path of the internal manifest inside the archive."""
+        return self._entry.get("internal_manifest_path", "__manifest__.jsonl")
+
+    @property
+    def entry(self) -> ShardEntry:
+        """The underlying :class:`ShardEntry` dict."""
+        return self._entry
+
+    @property
+    def store(self) -> S3ExchangeStore:
+        """Parent :class:`S3ExchangeStore`."""
+        return self._store
+
+    # ------------------------------------------------------------------ #
+    #  Archive data access (lazy & cached)                                #
+    # ------------------------------------------------------------------ #
+
+    def _get_archive_data(self) -> bytes:
+        """Download (and cache) the raw archive bytes from S3."""
+        if self._cached_archive_data is None:
+            stream = self._store.get_object(self.archive_key)
             try:
-                manifest_member = tar.getmember(internal_manifest_path)
-            except KeyError:
-                raise ShardReadError(f"Internal manifest not found: {internal_manifest_path}")
+                self._cached_archive_data = stream.read()
+            finally:
+                stream.close()
+        return self._cached_archive_data
 
-            manifest_file = tar.extractfile(manifest_member)
-            if manifest_file is None:
-                raise ShardReadError(f"Failed to extract internal manifest: {internal_manifest_path}")
+    def _open_tar(self) -> tuple[io.BytesIO, str]:
+        """Return ``(BytesIO buffer, tar open mode)`` for the cached archive."""
+        data = self._get_archive_data()
+        buf = io.BytesIO(data)
+        mode = Shard._determine_tar_mode(self.compression, read=True)
+        return buf, mode
 
-            # Parse internal manifest
-            entries: list[FileEntry] = []
-            line_number = 0
-            try:
-                for line in iter_manifest_lines(manifest_file):
-                    line_number += 1
-                    if line.strip():
-                        # Try to parse entry
+    # ------------------------------------------------------------------ #
+    #  Instance methods                                                   #
+    # ------------------------------------------------------------------ #
+
+    def get_manifest(self) -> Manifest:
+        """Return the internal manifest as a :class:`Manifest` object.
+
+        Returns
+        -------
+        Manifest
+            Manifest wrapping the shard's internal file entries.
+        """
+        entries = self._read_internal_manifest()
+        return Manifest.from_entries(self._store, entries)
+
+    def _read_internal_manifest(self) -> list[FileEntry]:
+        """Parse the ``__manifest__.jsonl`` inside the archive."""
+        buf, mode = self._open_tar()
+        try:
+            with tarfile.open(fileobj=buf, mode=mode) as tar:
+                try:
+                    manifest_member = tar.getmember(self.internal_manifest_path)
+                except KeyError:
+                    raise ShardReadError(f"Internal manifest not found: {self.internal_manifest_path}")
+
+                manifest_file = tar.extractfile(manifest_member)
+                if manifest_file is None:
+                    raise ShardReadError(f"Failed to extract internal manifest: {self.internal_manifest_path}")
+
+                entries: list[FileEntry] = []
+                line_number = 0
+                try:
+                    for line in Manifest.iter_lines(manifest_file):
+                        line_number += 1
+                        if not line.strip():
+                            continue
+
                         try:
-                            entry = parse_manifest_line(line, line_number)
+                            entry = Manifest.parse_line(line, line_number)
                         except InvalidManifestError as e:
-                            # If parsing fails due to missing 'key', try to handle it
-                            if "missing 'key'" in str(e).lower() and archive_key:
-                                # Parse JSON manually to add key
+                            # Backward compat: synthesise key from member_path
+                            if "missing 'key'" in str(e).lower() and self.archive_key:
                                 entry_dict: dict[str, Any] = json.loads(line.strip())
                                 if entry_dict.get("kind") == "file" and "key" not in entry_dict:
-                                    member_path = entry_dict.get("member_path", "")
-                                    if member_path:
-                                        entry_dict["key"] = f"{archive_key}#{member_path}"
+                                    mp = entry_dict.get("member_path", "")
+                                    if mp:
+                                        entry_dict["key"] = f"{self.archive_key}#{mp}"
                                     else:
-                                        raise  # Re-raise if we can't generate key
+                                        raise
                                 entry = entry_dict
                             else:
                                 raise
-                        
+
                         if entry.get("kind") != "file":
                             raise ShardReadError(f"Internal manifest entry must be 'file', got: {entry.get('kind')}")
-                        
-                        # Ensure key is present (for backward compatibility)
-                        if archive_key and "key" not in entry:
-                            member_path = entry.get("member_path", "")
-                            if member_path:
-                                entry["key"] = f"{archive_key}#{member_path}"
-                        
+
+                        # Ensure a virtual key exists
+                        if self.archive_key and "key" not in entry:
+                            mp = entry.get("member_path", "")
+                            if mp:
+                                entry["key"] = f"{self.archive_key}#{mp}"
+
                         entries.append(entry)
-            finally:
-                manifest_file.close()
+                finally:
+                    manifest_file.close()
 
-        return entries
-    except Exception as e:
-        if isinstance(e, ShardReadError):
+            return entries
+        except ShardReadError:
             raise
-        raise ShardReadError(f"Failed to read shard archive: {e}") from e
+        except Exception as e:
+            raise ShardReadError(f"Failed to read shard archive: {e}") from e
 
+    def iter_entries(self) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
+        """Iterate over data files (excludes the internal manifest).
 
-def iter_shard_members(
-    archive_stream: StreamingBody,
-    internal_manifest: list[FileEntry],
-    internal_manifest_path: str = "__manifest__.jsonl",
-    format: str = "tar",
-    compression: str | None = "gzip",
-) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
-    """Iterate over members in a shard archive, yielding (stream, entry) pairs.
+        Yields
+        ------
+        tuple[ArchiveMemberBody, FileEntry]
+            ``(stream, enriched_entry)`` for each data member.
+        """
+        internal_manifest = self._read_internal_manifest()
+        buf, mode = self._open_tar()
 
-    Parameters
-    ----------
-    archive_stream : StreamingBody
-        StreamingBody of the archive. Will be read completely into memory.
-    internal_manifest : list[FileEntry]
-        Pre-parsed internal manifest (required).
-    internal_manifest_path : str, optional
-        Path to internal manifest inside archive. Defaults to "__manifest__.jsonl".
-    format : str, optional
-        Archive format. Defaults to "tar".
-    compression : str | None, optional
-        Compression type ("gzip", None, etc.). Defaults to "gzip".
+        try:
+            with tarfile.open(fileobj=buf, mode=mode) as tar:
+                # Build lookup: member_path -> FileEntry
+                member_map: dict[str, FileEntry] = {}
+                for fe in internal_manifest:
+                    mp = fe.get("member_path", fe.get("key", ""))
+                    if mp:
+                        member_map[mp] = fe
 
-    Yields
-    ------
-    tuple[ArchiveMemberBody, FileEntry]
-        Tuples of (ArchiveMemberBody, FileEntry) for each file member.
-    """
-    # Read entire archive into memory to avoid streaming issues
-    try:
-        archive_data = archive_stream.read()
-    except Exception as e:
-        raise ShardReadError(f"Failed to read archive stream: {e}") from e
-    finally:
-        archive_stream.close()
-
-    # Create BytesIO buffer from archive data
-    archive_buffer = io.BytesIO(archive_data)
-
-    # Determine tar mode
-    mode = "r:"
-    if compression == "gzip":
-        mode += "gz"
-    elif compression:
-        mode += compression
-    else:
-        mode += ""
-
-    try:
-        # Open tar stream from buffer
-        with tarfile.open(fileobj=archive_buffer, mode=mode) as tar:
-            # Build member path -> entry mapping
-            member_map: dict[str, FileEntry] = {}
-            if internal_manifest:
-                for entry in internal_manifest:
-                    member_path = entry.get("member_path", entry.get("key", ""))
-                    if member_path:
-                        member_map[member_path] = entry
-
-            # Iterate over members
-            for member in tar:
-                if member.isfile():
-                    member_path = member.name
-
-                    # Skip internal manifest itself
-                    if member_path == internal_manifest_path:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    if member.name == self.internal_manifest_path:
                         continue
 
-                    # Get or create entry
-                    if member_path in member_map:
-                        entry = member_map[member_path]
+                    if member.name in member_map:
+                        entry = member_map[member.name]
                     else:
-                        # Create entry from member info
                         entry = FileEntry(
                             kind="file",
-                            member_path=member_path,
+                            member_path=member.name,
                             size_bytes=member.size if hasattr(member, "size") else None,
                         )
 
-                    # Extract file
                     member_file = tar.extractfile(member)
                     if member_file is None:
                         continue
 
-                    # Create a BytesIO buffer for the member file data
-                    # Read all data from the member file into memory
                     member_data = member_file.read()
                     member_file.close()
-                    member_buffer = io.BytesIO(member_data)
 
-                    yield ArchiveMemberBody(member_buffer, None), entry
-    except Exception as e:
-        raise ShardReadError(f"Failed to iterate shard members: {e}") from e
+                    # Enrich with archive context
+                    enriched: FileEntry = {
+                        **entry,
+                        "archive_key": self.archive_key,
+                        "member_path": entry.get("member_path", member.name),
+                    }
+                    if "key" not in enriched:
+                        enriched["key"] = f"{self.archive_key}#{member.name}"
 
-
-def get_shard_member(
-    archive_stream: StreamingBody,
-    member_path: str,
-    format: str = "tar",
-    compression: str | None = "gzip",
-    internal_manifest_path: str = "__manifest__.jsonl",
-) -> ArchiveMemberBody:
-    """Extract a specific member from a shard archive.
-
-    Parameters
-    ----------
-    archive_stream : StreamingBody
-        StreamingBody of the archive. Will be read completely into memory.
-    member_path : str
-        Path of the member file inside the archive.
-    format : str, optional
-        Archive format. Defaults to "tar".
-    compression : str | None, optional
-        Compression type ("gzip", None, etc.). Defaults to "gzip".
-    internal_manifest_path : str, optional
-        Path to internal manifest inside archive. Defaults to "__manifest__.jsonl".
-
-    Returns
-    -------
-    ArchiveMemberBody
-        StreamingBody-like object for the member file.
-
-    Raises
-    ------
-    ShardReadError
-        If archive is corrupt or member is not found.
-    ObjectNotFoundError
-        If member file is not found in the archive.
-    """
-    # Read entire archive into memory to avoid streaming issues
-    try:
-        archive_data = archive_stream.read()
-    except Exception as e:
-        raise ShardReadError(f"Failed to read archive stream: {e}") from e
-    finally:
-        archive_stream.close()
-
-    # Create BytesIO buffer from archive data
-    archive_buffer = io.BytesIO(archive_data)
-
-    # Determine tar mode
-    mode = "r:"
-    if compression == "gzip":
-        mode += "gz"
-    elif compression:
-        mode += compression
-    else:
-        mode += ""
-
-    try:
-        # Open tar stream from buffer
-        with tarfile.open(fileobj=archive_buffer, mode=mode) as tar:
-            # Find the member
-            try:
-                member = tar.getmember(member_path)
-            except KeyError:
-                raise ObjectNotFoundError(f"{member_path} not found in archive")
-
-            if not member.isfile():
-                raise ShardReadError(f"Member {member_path} is not a file")
-
-            # Extract file
-            member_file = tar.extractfile(member)
-            if member_file is None:
-                raise ShardReadError(f"Failed to extract member: {member_path}")
-
-            # Create a BytesIO buffer for the member file data
-            # Read all data from the member file into memory
-            member_data = member_file.read()
-            member_file.close()
-            member_buffer = io.BytesIO(member_data)
-
-            return ArchiveMemberBody(member_buffer, None)
-    except Exception as e:
-        if isinstance(e, (ShardReadError, ObjectNotFoundError)):
+                    yield ArchiveMemberBody(io.BytesIO(member_data)), enriched
+        except ShardReadError:
             raise
-        raise ShardReadError(f"Failed to extract shard member: {e}") from e
+        except Exception as e:
+            raise ShardReadError(f"Failed to iterate shard members: {e}") from e
 
+    def iter_objects(self) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
+        """Iterate over **all** archive members including the internal manifest.
 
-def create_shard_archive(
-    shard_items: Sequence[ShardItem],
-    archive_key: str,
-    format: str = "tar",
-    compression: str | None = "gzip",
-    internal_manifest_path: str = "__manifest__.jsonl",
-    use_temp_file: bool = True,
-    temp_file_threshold: int = 100 * 1024 * 1024,  # 100 MB
-) -> tuple[bytes | Path, int]:
-    """Create a shard archive from items.
+        Yields
+        ------
+        tuple[ArchiveMemberBody, FileEntry]
+        """
+        buf, mode = self._open_tar()
+        try:
+            with tarfile.open(fileobj=buf, mode=mode) as tar:
+                for member in tar:
+                    if not member.isfile():
+                        continue
+                    member_file = tar.extractfile(member)
+                    if member_file is None:
+                        continue
 
-    Parameters
-    ----------
-    shard_items : Sequence[ShardItem]
-        Items to include in the archive.
-    archive_key : str
-        S3 key for the archive (used to generate virtual keys for internal manifest entries).
-    format : str, optional
-        Archive format. Defaults to "tar".
-    compression : str | None, optional
-        Compression type ("gzip", None, etc.). Defaults to "gzip".
-    internal_manifest_path : str, optional
-        Path for internal manifest inside archive. Defaults to "__manifest__.jsonl".
-    use_temp_file : bool, optional
-        If True, use temp file; if False, use in-memory buffer. Defaults to True.
-    temp_file_threshold : int, optional
-        Size threshold (bytes) for using temp file vs memory. Defaults to 100 MB.
+                    data = member_file.read()
+                    member_file.close()
 
-    Returns
-    -------
-    tuple[bytes | Path, int]
-        Tuple of (archive_data or Path, total_size_bytes).
-    """
-    if format != "tar":
-        raise ValueError(f"Unsupported archive format: {format}")
+                    entry: FileEntry = {
+                        "kind": "file",
+                        "key": f"{self.archive_key}#{member.name}",
+                        "member_path": member.name,
+                        "size_bytes": member.size if hasattr(member, "size") else None,
+                    }
+                    yield ArchiveMemberBody(io.BytesIO(data)), entry
+        except Exception as e:
+            if isinstance(e, ShardReadError):
+                raise
+            raise ShardReadError(f"Failed to iterate shard objects: {e}") from e
 
-    # Determine tar mode
-    mode = "w|"
-    if compression == "gzip":
-        mode += "gz"
-    elif compression:
-        mode += compression
-    else:
-        mode += ""
+    def get_member(self, member_path: str) -> ArchiveMemberBody:
+        """Extract a single member from the archive.
 
-    # Estimate total size to decide on temp file
-    total_size_estimate = sum(item.get("size_bytes", 0) or 0 for item in shard_items)
-    use_temp = use_temp_file and total_size_estimate > temp_file_threshold
+        Parameters
+        ----------
+        member_path : str
+            Path inside the tar archive.
 
-    # Build internal manifest entries
-    internal_entries: list[FileEntry] = []
-    for item in shard_items:
-        member_path = item["member_path"]
-        size_bytes = item.get("size_bytes")
+        Returns
+        -------
+        ArchiveMemberBody
 
-        # Try to get size from source if not provided
-        if size_bytes is None:
-            source = item.get("source")
-            if isinstance(source, (str, Path)):
+        Raises
+        ------
+        ObjectNotFoundError
+            If the member does not exist.
+        ShardReadError
+            If extraction fails.
+        """
+        buf, mode = self._open_tar()
+        try:
+            with tarfile.open(fileobj=buf, mode=mode) as tar:
                 try:
-                    size_bytes = os.path.getsize(source)
+                    member = tar.getmember(member_path)
+                except KeyError:
+                    raise ObjectNotFoundError(f"{member_path} not found in archive")
+
+                if not member.isfile():
+                    raise ShardReadError(f"Member {member_path} is not a file")
+
+                member_file = tar.extractfile(member)
+                if member_file is None:
+                    raise ShardReadError(f"Failed to extract member: {member_path}")
+
+                data = member_file.read()
+                member_file.close()
+                return ArchiveMemberBody(io.BytesIO(data))
+        except (ShardReadError, ObjectNotFoundError):
+            raise
+        except Exception as e:
+            raise ShardReadError(f"Failed to extract shard member: {e}") from e
+
+    def delete(self) -> None:
+        """Delete the shard archive from S3."""
+        self._store.delete_key(self.archive_key)
+
+    # ------------------------------------------------------------------ #
+    #  Static / class-level utilities                                     #
+    # ------------------------------------------------------------------ #
+
+    @staticmethod
+    def infer_archive_format(archive_key: str) -> tuple[str, str | None]:
+        """Infer ``(format, compression)`` from an archive key extension.
+
+        Parameters
+        ----------
+        archive_key : str
+
+        Returns
+        -------
+        tuple[str, str | None]
+            ``(format, compression)`` - e.g. ``("tar", "gzip")``.
+        """
+        fmt = "tar"
+        compression: str | None = None
+        if archive_key.endswith(".tar.gz") or archive_key.endswith(".tgz"):
+            compression = "gzip"
+        elif archive_key.endswith(".tar.bz2"):
+            compression = "bzip2"
+        elif archive_key.endswith(".tar.xz"):
+            compression = "xz"
+        return fmt, compression
+
+    @staticmethod
+    def _determine_tar_mode(
+        compression: str | None,
+        *,
+        read: bool = True,
+        streaming: bool = False,
+    ) -> str:
+        """Build a ``tarfile.open`` mode string.
+
+        Parameters
+        ----------
+        compression : str | None
+            Compression algorithm.
+        read : bool
+            *True* for reading, *False* for writing.
+        streaming : bool
+            Use streaming (``|``) separator (write-only).
+
+        Returns
+        -------
+        str
+        """
+        if read:
+            mode = "r:"
+        elif streaming:
+            mode = "w|"
+        else:
+            mode = "w:"
+
+        if compression == "gzip":
+            mode += "gz"
+        elif compression:
+            mode += compression
+        return mode
+
+    @staticmethod
+    def create_archive(
+        shard_items: Sequence[ShardItem],
+        archive_key: str,
+        *,
+        format: str = "tar",
+        compression: str | None = "gzip",
+        internal_manifest_path: str = "__manifest__.jsonl",
+        use_temp_file: bool = True,
+        temp_file_threshold: int = 100 * 1024 * 1024,
+    ) -> tuple[bytes | Path, int]:
+        """Create a shard tar archive from *shard_items*.
+
+        Parameters
+        ----------
+        shard_items : Sequence[ShardItem]
+            Items to include in the archive.
+        archive_key : str
+            S3 key for the archive (used for virtual key generation).
+        format : str
+            Archive format (only ``"tar"`` is supported).
+        compression : str | None
+            Compression algorithm (``"gzip"``, ``None``, …).
+        internal_manifest_path : str
+            Path for the internal manifest inside the archive.
+        use_temp_file : bool
+            Use a temp file for large archives.
+        temp_file_threshold : int
+            Byte threshold for switching to temp-file mode.
+
+        Returns
+        -------
+        tuple[bytes | Path, int]
+            ``(archive_data_or_path, total_size_bytes)``
+        """
+        if format != "tar":
+            raise ValueError(f"Unsupported archive format: {format}")
+
+        mode = Shard._determine_tar_mode(compression, read=False, streaming=True)
+
+        # Estimate total size to decide temp-file vs in-memory
+        total_size_estimate = sum(item.get("size_bytes", 0) or 0 for item in shard_items)
+        use_temp = use_temp_file and total_size_estimate > temp_file_threshold
+
+        # Build internal manifest entries
+        internal_entries: list[FileEntry] = []
+        for item in shard_items:
+            member_path = item["member_path"]
+            size_bytes = item.get("size_bytes")
+            if size_bytes is None:
+                source = item.get("source")
+                if isinstance(source, (str, Path)):
+                    try:
+                        size_bytes = os.path.getsize(source)
+                    except OSError:
+                        pass
+
+            internal_entries.append(
+                FileEntry(
+                    kind="file",
+                    key=f"{archive_key}#{member_path}",
+                    member_path=member_path,
+                    id=item.get("id"),
+                    meta=item.get("meta"),
+                    size_bytes=size_bytes,
+                )
+            )
+
+        manifest_content = "\n".join(Manifest.serialize_entry(e) for e in internal_entries) + "\n"
+        manifest_bytes = manifest_content.encode("utf-8")
+
+        # ---- temp-file path ---- #
+        if use_temp:
+            fd, temp_path = tempfile.mkstemp(
+                suffix=".tar.gz" if compression == "gzip" else ".tar",
+            )
+            try:
+                with open(fd, "wb") as f:
+                    with tarfile.open(fileobj=f, mode=mode) as tar:
+                        # Internal manifest
+                        info = tarfile.TarInfo(name=internal_manifest_path)
+                        info.size = len(manifest_bytes)
+                        tar.addfile(info, io.BytesIO(manifest_bytes))
+
+                        for item in shard_items:
+                            source = item["source"]
+                            mp = item["member_path"]
+                            if isinstance(source, (str, Path)):
+                                tar.add(str(source), arcname=mp)
+                            elif isinstance(source, bytes):
+                                ti = tarfile.TarInfo(name=mp)
+                                ti.size = len(source)
+                                tar.addfile(ti, io.BytesIO(source))
+                            else:
+                                raise ValueError(f"Unsupported source type: {type(source)}")
+
+                total_size = os.path.getsize(temp_path)
+                return Path(temp_path), total_size
+            except Exception:
+                try:
+                    os.unlink(temp_path)
                 except OSError:
                     pass
+                raise
 
-        entry: FileEntry = {
-            "kind": "file",
-            "key": f"{archive_key}#{member_path}",
-            "member_path": member_path,
-            "id": item.get("id"),
-            "meta": item.get("meta"),
-            "size_bytes": size_bytes,
-        }
-        internal_entries.append(entry)
-
-    # Create archive
-    if use_temp:
-        # Use temporary file
-        fd, temp_path = tempfile.mkstemp(suffix=".tar.gz" if compression == "gzip" else ".tar")
-        try:
-            with open(fd, "wb") as f:
-                with tarfile.open(fileobj=f, mode=mode) as tar:
-                    # Write internal manifest first
-                    manifest_content = "\n".join(serialize_manifest_entry(entry) for entry in internal_entries) + "\n"
-                    manifest_info = tarfile.TarInfo(name=internal_manifest_path)
-                    manifest_info.size = len(manifest_content.encode("utf-8"))
-                    tar.addfile(manifest_info, io.BytesIO(manifest_content.encode("utf-8")))
-
-                    # Add file members
-                    for item in shard_items:
-                        source = item["source"]
-                        member_path = item["member_path"]
-
-                        if isinstance(source, (str, Path)):
-                            # Add file from path
-                            tar.add(source, arcname=member_path)
-                        elif isinstance(source, bytes):
-                            # Add from bytes
-                            info = tarfile.TarInfo(name=member_path)
-                            info.size = len(source)
-                            tar.addfile(info, io.BytesIO(source))
-                        else:
-                            raise ValueError(f"Unsupported source type: {type(source)}")
-
-            total_size = os.path.getsize(temp_path)
-            return Path(temp_path), total_size
-        except Exception:
-            # Clean up temp file on error
-            try:
-                os.unlink(temp_path)
-            except OSError:
-                pass
-            raise
-    else:
-        # Use in-memory buffer
+        # ---- in-memory path ---- #
         buffer = io.BytesIO()
         with tarfile.open(fileobj=buffer, mode=mode) as tar:
-            # Write internal manifest first
-            manifest_content = "\n".join(serialize_manifest_entry(entry) for entry in internal_entries) + "\n"
-            manifest_info = tarfile.TarInfo(name=internal_manifest_path)
-            manifest_info.size = len(manifest_content.encode("utf-8"))
-            tar.addfile(manifest_info, io.BytesIO(manifest_content.encode("utf-8")))
+            info = tarfile.TarInfo(name=internal_manifest_path)
+            info.size = len(manifest_bytes)
+            tar.addfile(info, io.BytesIO(manifest_bytes))
 
-            # Add file members
             for item in shard_items:
                 source = item["source"]
-                member_path = item["member_path"]
-
+                mp = item["member_path"]
                 if isinstance(source, (str, Path)):
-                    # Read file and add
-                    with open(source, "rb") as f:
+                    with open(str(source), "rb") as f:
                         file_data = f.read()
-                    info = tarfile.TarInfo(name=member_path)
-                    info.size = len(file_data)
-                    tar.addfile(info, io.BytesIO(file_data))
+                    ti = tarfile.TarInfo(name=mp)
+                    ti.size = len(file_data)
+                    tar.addfile(ti, io.BytesIO(file_data))
                 elif isinstance(source, bytes):
-                    # Add from bytes
-                    info = tarfile.TarInfo(name=member_path)
-                    info.size = len(source)
-                    tar.addfile(info, io.BytesIO(source))
+                    ti = tarfile.TarInfo(name=mp)
+                    ti.size = len(source)
+                    tar.addfile(ti, io.BytesIO(source))
                 else:
                     raise ValueError(f"Unsupported source type: {type(source)}")
 
@@ -555,66 +641,66 @@ def create_shard_archive(
         data = buffer.getvalue()
         return data, len(data)
 
+    @staticmethod
+    def split_items(
+        items: Iterable[ShardItem],
+        *,
+        max_entries: int | None = None,
+        max_bytes: int | None = None,
+    ) -> Iterator[list[ShardItem]]:
+        """Split items into shard-sized batches.
 
-def create_shards(
-    items: Iterable[ShardItem],
-    *,
-    max_entries: int | None = None,
-    max_bytes: int | None = None,
-) -> Iterator[list[ShardItem]]:
-    """Split items into shard batches based on entry count or byte size limits.
+        Parameters
+        ----------
+        items : Iterable[ShardItem]
+            Items to partition.
+        max_entries : int | None
+            Max entries per batch.
+        max_bytes : int | None
+            Max bytes per batch.
 
-    Parameters
-    ----------
-    items : Iterable[ShardItem]
-        Iterable of shard items.
-    max_entries : int | None, optional
-        Maximum entries per shard. If None, no limit.
-    max_bytes : int | None, optional
-        Maximum bytes per shard. If None, no limit.
+        Yields
+        ------
+        list[ShardItem]
+        """
+        if max_entries is None and max_bytes is None:
+            yield list(items)
+            return
 
-    Yields
-    ------
-    list[ShardItem]
-        Lists of ShardItem for each shard batch.
-    """
-    if max_entries is None and max_bytes is None:
-        # No limits - yield all items as single shard
-        yield list(items)
-        return
+        current_shard: list[ShardItem] = []
+        current_bytes = 0
+        current_count = 0
 
-    current_shard: list[ShardItem] = []
-    current_bytes = 0
-    current_count = 0
+        for item in items:
+            item_size = item.get("size_bytes")
+            if item_size is None:
+                source = item.get("source")
+                if isinstance(source, (str, Path)):
+                    try:
+                        item_size = os.path.getsize(source)
+                    except OSError:
+                        item_size = None
 
-    for item in items:
-        # Get item size
-        item_size = item.get("size_bytes")
-        if item_size is None:
-            source = item.get("source")
-            if isinstance(source, (str, Path)):
-                try:
-                    item_size = os.path.getsize(source)
-                except OSError:
-                    item_size = None
+            would_exceed_entries = max_entries is not None and current_count >= max_entries
+            would_exceed_bytes = max_bytes is not None and item_size is not None and current_bytes + item_size > max_bytes
 
-        # Check if adding this item would exceed limits
-        would_exceed_entries = max_entries is not None and current_count >= max_entries
-        would_exceed_bytes = max_bytes is not None and item_size is not None and current_bytes + item_size > max_bytes
+            if current_shard and (would_exceed_entries or would_exceed_bytes):
+                yield current_shard
+                current_shard = []
+                current_bytes = 0
+                current_count = 0
 
-        # If current shard is non-empty and would exceed limits, yield it
-        if current_shard and (would_exceed_entries or would_exceed_bytes):
+            current_shard.append(item)
+            current_count += 1
+            if item_size is not None:
+                current_bytes += item_size
+
+        if current_shard:
             yield current_shard
-            current_shard = []
-            current_bytes = 0
-            current_count = 0
 
-        # Add item to current shard
-        current_shard.append(item)
-        current_count += 1
-        if item_size is not None:
-            current_bytes += item_size
+    # ------------------------------------------------------------------ #
+    #  Dunder helpers                                                     #
+    # ------------------------------------------------------------------ #
 
-    # Yield final shard if non-empty
-    if current_shard:
-        yield current_shard
+    def __repr__(self) -> str:
+        return f"Shard(archive_key={self.archive_key!r})"

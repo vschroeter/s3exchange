@@ -10,19 +10,9 @@ from .exceptions import (
     S3ExchangeError,
     ShardReadError,
 )
-from .manifest import (
-    generate_part_manifest_key,
-    iter_manifest_entries,
-    write_manifest_to_s3,
-)
+from .manifest import Manifest
 from .settings import S3Settings
-from .shard import (
-    ArchiveMemberBody,
-    create_shard_archive,
-    create_shards,
-    iter_shard_members,
-    read_shard_internal_manifest,
-)
+from .shard import ArchiveMemberBody, Shard
 from .store import S3ExchangeStore, ScopedStore
 from .types import (
     CompactReport,
@@ -48,7 +38,12 @@ __all__ = [
     # Main classes
     "S3ExchangeStore",
     "ScopedStore",
+    "Manifest",
+    "Shard",
     "ManifestWriter",
+    "ArchiveMemberBody",
+    # Settings
+    "S3Settings",
     # Types
     "ManifestEntry",
     "ManifestRef",
@@ -68,16 +63,6 @@ __all__ = [
     "ShardReadError",
     "ObjectNotFoundError",
     "ManifestNotFoundError",
-    # Manifest utilities
-    "iter_manifest_entries",
-    "write_manifest_to_s3",
-    "generate_part_manifest_key",
-    # Shard utilities
-    "ArchiveMemberBody",
-    "read_shard_internal_manifest",
-    "iter_shard_members",
-    "create_shard_archive",
-    "create_shards",
     # Utils
     "normalize_key",
     "resolve_template",

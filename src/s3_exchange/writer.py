@@ -8,8 +8,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, BinaryIO, Literal
 
-from .manifest import generate_part_manifest_key, serialize_manifest_entry, write_manifest_to_s3
-from .shard import create_shard_archive
+from .manifest import Manifest
 from .types import (
     FileEntry,
     ManifestEntry,
@@ -32,7 +31,7 @@ class ManifestWriter:
 
     def __init__(
         self,
-        store: Any,  # S3ExchangeStore
+        store: Any,  # S3ExchangeStore (avoid circular import)
         manifest_key: str,
         *,
         mode: Literal["overwrite", "append_parts"] = "append_parts",
@@ -40,7 +39,7 @@ class ManifestWriter:
         part_max_bytes: int = 50 * 1024 * 1024,
         shard_size: ShardSizePolicy | None = None,
         shard_prefix: str | None = None,
-        shard_format: str = "tar",
+        shard_format: Literal["tar", "gzip"] | None = "tar",
         shard_compression: str | None = None,
         internal_manifest_path: str = "__manifest__.jsonl",
         publish_on_error: bool = False,
@@ -53,26 +52,24 @@ class ManifestWriter:
             S3ExchangeStore instance.
         manifest_key : str
             Root manifest key.
-        mode : Literal["overwrite", "append_parts"], optional
-            Write mode. "overwrite" writes single buffer on close.
-            "append_parts" flushes parts incrementally. Defaults to "append_parts".
-        part_max_entries : int, optional
-            Maximum entries per part before flush. Defaults to 50_000.
-        part_max_bytes : int, optional
-            Maximum bytes per part before flush. Defaults to 50MB.
-        shard_size : ShardSizePolicy | None, optional
-            If set, enables shard buffering with size limits. Defaults to None.
-        shard_prefix : str | None, optional
-            Prefix for shard archives. If None, derived from manifest_key.
-            Defaults to None.
-        shard_format : str, optional
-            Archive format. Defaults to "tar".
-        shard_compression : str | None, optional
-            Compression type, one of ["gzip"]. Defaults to None.
-        internal_manifest_path : str, optional
-            Path to internal manifest inside archives. Defaults to "__manifest__.jsonl".
-        publish_on_error : bool, optional
-            If True, publish root manifest even on exception. Defaults to False.
+        mode : ``"overwrite"`` | ``"append_parts"``
+            Write mode.
+        part_max_entries : int
+            Max entries per part before flush.
+        part_max_bytes : int
+            Max bytes per part before flush.
+        shard_size : ShardSizePolicy | None
+            Shard buffering policy (``None`` disables shard buffering).
+        shard_prefix : str | None
+            Prefix for shard archives (derived from *manifest_key* when *None*).
+        shard_format : str
+            Archive format.
+        shard_compression : str | None
+            Compression type. Default is no `tar`, so no compression.
+        internal_manifest_path : str
+            Internal manifest path inside archives. Default is "__manifest__.jsonl".
+        publish_on_error : bool
+            If *True*, publish root manifest even on exception.
         """
         self.store = store
         self.manifest_key = manifest_key
@@ -87,7 +84,6 @@ class ManifestWriter:
 
         # Determine shard prefix
         if shard_prefix is None:
-            # Derive from manifest_key: training/.../manifest.jsonl -> training/.../shards/
             if "/" in manifest_key:
                 parent = "/".join(manifest_key.split("/")[:-1])
                 self.shard_prefix = f"{parent}/shards"
@@ -113,7 +109,7 @@ class ManifestWriter:
 
         # Initialize part buffer
         self._part_buffer = tempfile.SpooledTemporaryFile(
-            max_size=10 * 1024 * 1024,  # 10MB before switching to disk
+            max_size=10 * 1024 * 1024,
             mode="w+b",
         )
 
@@ -121,25 +117,20 @@ class ManifestWriter:
         """Context manager entry."""
         return self
 
-    def __exit__(self, exc_type: type[BaseException] | None, exc: BaseException | None, tb: Any) -> None:
-        """Context manager exit.
-
-        If no exception and publish_on_error is False, calls close().
-        If exception and publish_on_error is True, calls close().
-        Otherwise, does not publish root manifest.
-        """
+    def __exit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: Any,
+    ) -> None:
+        """Context manager exit - publishes on success or when *publish_on_error*."""
         if exc is None:
-            # Normal exit - always close
             self.close()
         elif self.publish_on_error:
-            # Exception but publish_on_error=True - still close
             try:
                 self.close()
             except Exception:
-                pass  # Suppress errors during error handling
-        # Otherwise: exception and publish_on_error=False - don't publish
-
-        # Always clean up resources
+                pass
         self._cleanup()
 
     def _cleanup(self) -> None:
@@ -151,13 +142,17 @@ class ManifestWriter:
                 pass
             self._part_buffer = None
 
+    # ------------------------------------------------------------------ #
+    #  Entry helpers                                                      #
+    # ------------------------------------------------------------------ #
+
     def add_entry(self, entry: ManifestEntry) -> None:
         """Add a manifest entry to the current part buffer.
 
         Parameters
         ----------
         entry : ManifestEntry
-            Manifest entry to add.
+            Entry to add.
 
         Raises
         ------
@@ -167,19 +162,15 @@ class ManifestWriter:
         if self._closed:
             raise RuntimeError("ManifestWriter is closed")
 
-        # Serialize entry
-        line_str = serialize_manifest_entry(entry)
+        line_str = Manifest.serialize_entry(entry)
         line_bytes = (line_str + "\n").encode("utf-8")
 
-        # Write to buffer
         assert self._part_buffer is not None
         self._part_buffer.write(line_bytes)
 
-        # Update counters
         self._part_entries_count += 1
         self._part_bytes_count += len(line_bytes)
 
-        # Check if we need to flush
         if self.mode == "append_parts":
             if self._part_entries_count >= self.part_max_entries or self._part_bytes_count >= self.part_max_bytes:
                 self.flush_part()
@@ -194,29 +185,27 @@ class ManifestWriter:
         size_bytes: int | None = None,
         etag: str | None = None,
     ) -> FileEntry:
-        """Add a file entry (assumes object already exists in S3).
+        """Add a file entry (assumes the object already exists in S3).
 
         Parameters
         ----------
         key : str
             S3 object key.
-        id : str | None, optional
-            Optional ID. If None, inferred from key.
-        meta : dict[str, Any] | None, optional
+        id : str | None
+            Optional ID (inferred from *key* when *None*).
+        meta : dict[str, Any] | None
             Optional metadata.
-        content_type : str | None, optional
+        content_type : str | None
             Optional content type.
-        size_bytes : int | None, optional
-            Optional size in bytes.
-        etag : str | None, optional
+        size_bytes : int | None
+            Optional size.
+        etag : str | None
             Optional ETag.
 
         Returns
         -------
         FileEntry
-            Created file entry.
         """
-        # Infer ID if not provided
         if id is None:
             id = self.store.infer_id(key)
 
@@ -236,38 +225,44 @@ class ManifestWriter:
     def put_object(
         self,
         key: str,
-        data: bytes | Any,  # bytes, BinaryIO, or PathLike
+        data: bytes | Any,
         *,
         id: str | None = None,
         meta: dict[str, Any] | None = None,
         content_type: str | None = None,
     ) -> FileEntry:
-        """Put an object to S3 and add file entry to manifest.
+        """Upload an object to S3 and add its file entry to the manifest.
 
         Parameters
         ----------
         key : str
             S3 object key.
         data : bytes | Any
-            Object data (bytes, file-like, or path).
-        id : str | None, optional
-            Optional ID. If None, inferred from key.
-        meta : dict[str, Any] | None, optional
+            Object data.
+        id : str | None
+            Optional ID.
+        meta : dict[str, Any] | None
             Optional metadata.
-        content_type : str | None, optional
+        content_type : str | None
             Optional content type.
 
         Returns
         -------
         FileEntry
-            Created file entry.
         """
-        # Upload object
-        entry = self.store.put_object(key, data, id=id, meta=meta, content_type=content_type)
-
-        # Add to manifest
+        entry = self.store.put_object(
+            key,
+            data,
+            id=id,
+            meta=meta,
+            content_type=content_type,
+        )
         self.add_entry(entry)
         return entry
+
+    # ------------------------------------------------------------------ #
+    #  Part flushing                                                      #
+    # ------------------------------------------------------------------ #
 
     def flush_part(self) -> str | None:
         """Flush current part buffer to S3 as a part manifest.
@@ -275,27 +270,21 @@ class ManifestWriter:
         Returns
         -------
         str | None
-            Uploaded part key, or None if buffer was empty or mode is overwrite.
+            Uploaded part key, or *None* if empty / overwrite mode.
         """
         if self._closed:
             raise RuntimeError("ManifestWriter is closed")
 
-        # In overwrite mode, don't flush parts
         if self.mode == "overwrite":
             return None
 
-        # Check if buffer has content
         assert self._part_buffer is not None
         if self._part_entries_count == 0:
             return None
 
-        # Generate part key
-        part_key = generate_part_manifest_key(self.manifest_key)
+        part_key = Manifest.generate_part_key(self.manifest_key)
 
-        # Rewind buffer and read entries
         self._part_buffer.seek(0)
-
-        # Read all content and parse entries
         content_bytes = self._part_buffer.read()
         content_str = content_bytes.decode("utf-8")
 
@@ -306,15 +295,13 @@ class ManifestWriter:
                 entry: ManifestEntry = json.loads(line)
                 entries.append(entry)
 
-        # Upload part manifest
-        write_manifest_to_s3(
+        Manifest.write_to_s3(
             self.store.s3_client,
             self.store.bucket,
             part_key,
             entries,
         )
 
-        # Record part key
         self._new_part_keys.append(part_key)
 
         # Reset buffer
@@ -325,30 +312,31 @@ class ManifestWriter:
 
         return part_key
 
+    # ------------------------------------------------------------------ #
+    #  Shard buffering                                                    #
+    # ------------------------------------------------------------------ #
+
     def add_shard_item(self, item: ShardItem) -> None:
         """Add an item to the shard buffer.
 
         Parameters
         ----------
         item : ShardItem
-            Shard item to add.
+            Shard item to buffer.
 
         Raises
         ------
         RuntimeError
-            If writer is closed or shard_size not configured.
+            If writer is closed or shard buffering is not enabled.
         """
         if self._closed:
             raise RuntimeError("ManifestWriter is closed")
-
         if self.shard_size is None:
             raise RuntimeError("Shard buffering not enabled (shard_size not set)")
 
-        # Add to buffer
         self._shard_items.append(item)
         self._shard_entry_count += 1
 
-        # Update byte count
         item_size = item.get("size_bytes")
         if item_size is None:
             source = item.get("source")
@@ -363,7 +351,6 @@ class ManifestWriter:
         if item_size is not None:
             self._shard_byte_count += item_size
 
-        # Check if we need to flush
         should_flush = False
         if self.shard_size.max_entries is not None:
             if self._shard_entry_count >= self.shard_size.max_entries:
@@ -393,42 +380,34 @@ class ManifestWriter:
             Path inside the archive.
         source : bytes | Path | BinaryIO
             Data source.
-        id : str | None, optional
+        id : str | None
             Optional ID.
-        meta : dict[str, Any] | None, optional
+        meta : dict[str, Any] | None
             Optional metadata.
-        size_bytes : int | None, optional
-            Size in bytes. Required for BinaryIO sources.
-        content_type : str | None, optional
+        size_bytes : int | None
+            Size in bytes (required for BinaryIO sources).
+        content_type : str | None
             Optional content type (stored in meta).
 
         Raises
         ------
         ValueError
-            If source is BinaryIO and size_bytes is not provided.
+            If source is BinaryIO and *size_bytes* is not provided.
         """
-        # Handle BinaryIO by reading into bytes
         if not isinstance(source, (bytes, str, Path)):
-            # BinaryIO or other file-like - read into bytes
             if size_bytes is None:
                 raise ValueError("size_bytes required for BinaryIO/file-like sources")
-            # Read the data
-            source_bytes = source.read()
-            source = source_bytes
-            # size_bytes was already validated above, keep it
+            source = source.read()  # type: ignore[assignment]
         elif isinstance(source, bytes):
-            # Can get from len
             if size_bytes is None:
                 size_bytes = len(source)
-        # For str/Path, size_bytes will be determined in add_shard_item if needed
 
-        # Build meta dict
         item_meta = meta or {}
         if content_type:
             item_meta["content_type"] = content_type
 
         item: ShardItem = {
-            "source": source,  # type: ignore[assignment]  # Now guaranteed to be bytes | Path | str
+            "source": source,  # type: ignore[assignment]
             "member_path": member_path,
             "id": id,
             "meta": item_meta if item_meta else None,
@@ -438,28 +417,25 @@ class ManifestWriter:
         self.add_shard_item(item)
 
     def flush_shard(self) -> ShardEntry | None:
-        """Flush current shard buffer to S3 as a shard archive.
+        """Flush the shard buffer to S3.
 
         Returns
         -------
         ShardEntry | None
-            Created shard entry, or None if buffer was empty.
+            The created shard entry, or *None* if buffer was empty.
         """
         if self._closed:
             raise RuntimeError("ManifestWriter is closed")
-
         if not self._shard_items:
             return None
 
-        # Generate archive key
         self._shard_sequence += 1
         archive_suffix = ".tar"
         if self.shard_compression == "gzip":
             archive_suffix += ".gz"
         archive_key = f"{self.shard_prefix}/shard-{self._shard_sequence:06d}{archive_suffix}"
 
-        # Create and upload archive
-        shard_entry = self.store.put_shard_archive(
+        shard = self.store.put_shard_archive(
             archive_key,
             self._shard_items,
             format=self.shard_format,
@@ -467,21 +443,24 @@ class ManifestWriter:
             internal_manifest_path=self.internal_manifest_path,
         )
 
-        # Add shard entry to manifest
-        self.add_entry(shard_entry)
+        # Add the shard entry to the manifest buffer
+        self.add_entry(shard.entry)
 
-        # Clear buffer
         self._shard_items = []
         self._shard_entry_count = 0
         self._shard_byte_count = 0
 
-        return shard_entry
+        return shard.entry
+
+    # ------------------------------------------------------------------ #
+    #  Lifecycle                                                          #
+    # ------------------------------------------------------------------ #
 
     def close(self) -> None:
-        """Close the writer and publish root manifest.
+        """Close the writer and publish the root manifest.
 
-        Flushes any pending shard buffer, flushes current part buffer,
-        and updates root manifest with new part references (in append_parts mode).
+        Flushes any pending shard buffer and part buffer, then updates the
+        root manifest with new part references (in ``append_parts`` mode).
 
         Raises
         ------
@@ -496,14 +475,9 @@ class ManifestWriter:
             if self.shard_size is not None:
                 self.flush_shard()
 
-            # Flush current part buffer
             if self.mode == "overwrite":
-                # Upload entire buffer as root manifest
                 assert self._part_buffer is not None
                 if self._part_entries_count > 0:
-                    self._part_buffer.seek(0)
-
-                    # Read entries from buffer
                     self._part_buffer.seek(0)
                     content_bytes = self._part_buffer.read()
                     content_str = content_bytes.decode("utf-8")
@@ -515,20 +489,17 @@ class ManifestWriter:
                             entry: ManifestEntry = json.loads(line)
                             entries.append(entry)
 
-                    # Upload root manifest
-                    write_manifest_to_s3(
+                    Manifest.write_to_s3(
                         self.store.s3_client,
                         self.store.bucket,
                         self.manifest_key,
                         entries,
                     )
             else:
-                # append_parts mode - flush last part if any
+                # append_parts - flush last part
                 self.flush_part()
 
-                # Update root manifest with new part references
                 if self._new_part_keys:
-                    # Read existing root manifest entries (without resolving refs)
                     root_entries: list[ManifestEntry] = []
                     if self.store.exists(self.manifest_key):
                         try:
@@ -539,10 +510,8 @@ class ManifestWriter:
                                 )
                             )
                         except Exception:
-                            # If reading fails, start fresh
                             root_entries = []
 
-                    # Append new part references
                     for part_key in self._new_part_keys:
                         ref_entry: ManifestRefEntry = {
                             "kind": "manifest_ref",
@@ -550,8 +519,7 @@ class ManifestWriter:
                         }
                         root_entries.append(ref_entry)
 
-                    # Write updated root manifest
-                    write_manifest_to_s3(
+                    Manifest.write_to_s3(
                         self.store.s3_client,
                         self.store.bucket,
                         self.manifest_key,
@@ -563,16 +531,15 @@ class ManifestWriter:
 
     @property
     def is_closed(self) -> bool:
-        """Check if writer is closed."""
+        """Whether the writer has been closed."""
         return self._closed
 
     def stats(self) -> dict[str, Any]:
-        """Get writer statistics.
+        """Return writer statistics.
 
         Returns
         -------
         dict[str, Any]
-            Statistics dict with counts and sizes.
         """
         return {
             "part_entries": self._part_entries_count,
