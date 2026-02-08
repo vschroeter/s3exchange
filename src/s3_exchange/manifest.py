@@ -121,6 +121,7 @@ class Manifest:
         self,
         *,
         resolve_refs: bool = True,
+        limit: int | None = None,
     ) -> Iterator[ManifestEntry]:
         """Iterate over manifest entries, optionally resolving ``manifest_ref``.
         This method does not resolve shard entries. Use :meth:`iter_objects` to iterate over shard entries.
@@ -129,20 +130,25 @@ class Manifest:
         ----------
         resolve_refs : bool
             If *True* (default), recursively inline referenced manifests.
+        limit : int | None
+            Maximum number of entries to yield. If None, yields all entries.
 
         Yields
         ------
         ManifestEntry
         """
         visited: set[str] = set()
-        yield from self._iter_recursive(resolve_refs=resolve_refs, visited=visited)
+        yield from self._iter_recursive(resolve_refs=resolve_refs, visited=visited, limit=limit)
 
     def _iter_recursive(
         self,
         *,
         resolve_refs: bool,
         visited: set[str],
+        limit: int | None = None,
     ) -> Iterator[ManifestEntry]:
+        if limit is not None and limit <= 0:
+            return
         if self._key is not None:
             if self._key in visited:
                 return
@@ -157,21 +163,32 @@ class Manifest:
         else:
             return
 
+        count = 0
         for entry in raw:
+            if limit is not None and count >= limit:
+                break
             if resolve_refs and entry.get("kind") == "manifest_ref":
                 ref_key = entry["key"]
                 child = Manifest(self._store, key=ref_key)
-                yield from child._iter_recursive(
+                remaining_limit = None if limit is None else limit - count
+                for child_entry in child._iter_recursive(
                     resolve_refs=True,
                     visited=visited,
-                )
+                    limit=remaining_limit,
+                ):
+                    if limit is not None and count >= limit:
+                        break
+                    yield child_entry
+                    count += 1
             else:
                 yield entry
+                count += 1
 
     def iter_objects(
         self,
         *,
         expand_shards: bool = True,
+        limit: int | None = None,
     ) -> Iterator[tuple[StreamingBodyLike, ManifestEntry]]:
         """Iterate objects, yielding ``(stream, entry)`` pairs.
 
@@ -180,6 +197,8 @@ class Manifest:
         expand_shards : bool
             If *True* (default), shard entries are expanded into individual
             member streams.  When *False* the raw archive stream is yielded.
+        limit : int | None
+            Maximum number of objects to yield. If None, yields all objects.
 
         Yields
         ------
@@ -187,22 +206,99 @@ class Manifest:
         """
         from .shard import Shard  # lazy - avoids circular import
 
+        count = 0
         for entry in self.iter_entries(resolve_refs=True):
+            if limit is not None and count >= limit:
+                break
             kind = entry.get("kind")
 
             if kind == "file":
+                if limit is not None and count >= limit:
+                    break
                 stream = self._store.get_object(entry["key"])
                 yield stream, entry
+                count += 1
 
             elif kind == "shard" and expand_shards:
                 shard = Shard.from_entry(self._store, entry)
-                yield from shard.iter_entries()
+                remaining_limit = None if limit is None else limit - count
+                for stream, shard_entry in shard.iter_entries(limit=remaining_limit):
+                    if limit is not None and count >= limit:
+                        break
+                    yield stream, shard_entry
+                    count += 1
 
             elif kind == "shard" and not expand_shards:
+                if limit is not None and count >= limit:
+                    break
                 archive_key = entry["archive_key"]
                 stream = self._store.get_object(archive_key)
                 yield stream, entry
+                count += 1
             # manifest_ref entries already resolved by iter_entries
+
+    def get_keys(
+        self,
+        *,
+        expand_shards: bool = True,
+        resolve_refs: bool = True,
+        limit: int | None = None,
+    ) -> Iterator[str]:
+        """Get all keys from entries in the manifest.
+
+        Parameters
+        ----------
+        expand_shards : bool
+            If *True* (default), shard entries are expanded into individual
+            member keys.  When *False* the archive key is returned.
+        resolve_refs : bool
+            If *True* (default), automatically detect if a file is a manifest
+            and resolve its contents. When *False*, manifest_ref entries will
+            yield the manifest key itself rather than resolving it.
+        limit : int | None
+            Maximum number of keys to yield. If None, yields all keys.
+        Yields
+        ------
+        str
+            S3 keys (or virtual keys for shard members when expanded).
+        """
+        from .shard import Shard  # lazy - avoids circular import
+
+        count = 0
+
+        for entry in self.iter_entries(resolve_refs=resolve_refs):
+            kind = entry.get("kind")
+            if limit is not None and count >= limit:
+                break
+
+            if kind == "file":
+                count += 1
+                yield entry["key"]
+
+            elif kind == "shard" and expand_shards:
+                shard = Shard.from_entry(self._store, entry)
+                try:
+                    internal = shard.get_manifest()
+                    archive_key = shard.archive_key
+                    for member_entry in internal.iter_entries(resolve_refs=False):
+                        # Extract key from member entry, or construct virtual key
+                        if "key" in member_entry:
+                            count += 1
+                            yield member_entry["key"]
+                        else:
+                            member_path = member_entry.get("member_path", "")
+                            yield f"{archive_key}#{member_path}"
+                except Exception:
+                    pass  # skip unreadable shards
+
+            elif kind == "shard" and not expand_shards:
+                count += 1
+                yield entry["archive_key"]
+
+            elif kind == "manifest_ref" and not resolve_refs:
+                # If not resolving refs, yield the manifest key itself
+                count += 1
+                yield entry["key"]
 
     def list_files(
         self,
@@ -527,7 +623,7 @@ class Manifest:
         return entry
 
     @staticmethod
-    def iter_lines(stream: StreamingBody | Any) -> Iterator[str]:
+    def iter_lines(stream: StreamingBody | Any, limit: int | None = None) -> Iterator[str]:
         """Iterate over lines in a StreamingBody or file-like object.
 
         Handles both binary and text streams transparently.
@@ -536,26 +632,46 @@ class Manifest:
         ----------
         stream : StreamingBody | Any
             StreamingBody from S3, tarfile member, or any file-like object.
+        limit : int | None
+            Maximum number of lines to yield. If None, yields all lines.
 
         Yields
         ------
         str
         """
+        count = 0
         if hasattr(stream, "iter_lines"):
-            for raw_line in stream.iter_lines(chunk_size=8192):
-                yield raw_line.decode("utf-8")
+            try:
+                # Try calling with limit parameter (for our custom classes)
+                for raw_line in stream.iter_lines(chunk_size=8192, limit=limit):
+                    if limit is not None and count >= limit:
+                        break
+                    yield raw_line.decode("utf-8")
+                    count += 1
+            except TypeError:
+                # Fall back to calling without limit and applying limit manually
+                for raw_line in stream.iter_lines(chunk_size=8192):
+                    if limit is not None and count >= limit:
+                        break
+                    yield raw_line.decode("utf-8")
+                    count += 1
         else:
             buffer = b""
             chunk_size = 8192
             while True:
+                if limit is not None and count >= limit:
+                    break
                 chunk = stream.read(chunk_size)
                 if not chunk:
                     break
                 buffer += chunk
                 while b"\n" in buffer:
+                    if limit is not None and count >= limit:
+                        break
                     line_bytes, buffer = buffer.split(b"\n", 1)
                     yield line_bytes.decode("utf-8")
-            if buffer:
+                    count += 1
+            if buffer and (limit is None or count < limit):
                 yield buffer.decode("utf-8")
 
     @staticmethod

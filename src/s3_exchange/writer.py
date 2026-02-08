@@ -6,10 +6,10 @@ import json
 import os
 import tempfile
 from pathlib import Path
-from typing import Any, BinaryIO, Literal
+from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
-from .manifest import Manifest
-from .types import (
+from s3_exchange.manifest import Manifest
+from s3_exchange.types import (
     FileEntry,
     ManifestEntry,
     ManifestRefEntry,
@@ -17,6 +17,9 @@ from .types import (
     ShardItem,
     ShardSizePolicy,
 )
+
+if TYPE_CHECKING:
+    from s3_exchange.store import S3ExchangeStore
 
 
 class ManifestWriter:
@@ -31,7 +34,7 @@ class ManifestWriter:
 
     def __init__(
         self,
-        store: Any,  # S3ExchangeStore (avoid circular import)
+        store: S3ExchangeStore,
         manifest_key: str,
         *,
         mode: Literal["overwrite", "append_parts"] = "append_parts",
@@ -71,7 +74,7 @@ class ManifestWriter:
         publish_on_error : bool
             If *True*, publish root manifest even on exception.
         """
-        self.store = store
+        self.store: S3ExchangeStore = store
         self.manifest_key = manifest_key
         self.mode = mode
         self.part_max_entries = part_max_entries
@@ -217,6 +220,26 @@ class ManifestWriter:
             "content_type": content_type,
             "size_bytes": size_bytes,
             "etag": etag,
+        }
+
+        self.add_entry(entry)
+        return entry
+
+    def add_manifest(self, key: str) -> ManifestRefEntry:
+        """Add a manifest reference entry.
+
+        Parameters
+        ----------
+        key : str
+            S3 manifest key to reference.
+
+        Returns
+        -------
+        ManifestRefEntry
+        """
+        entry: ManifestRefEntry = {
+            "kind": "manifest_ref",
+            "key": key,
         }
 
         self.add_entry(entry)

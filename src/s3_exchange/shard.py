@@ -73,13 +73,15 @@ class ArchiveMemberBody:
         if self._fileobj:
             self._fileobj.close()
 
-    def iter_lines(self, chunk_size: int | None = None) -> Iterator[bytes]:
+    def iter_lines(self, chunk_size: int | None = None, limit: int | None = None) -> Iterator[bytes]:
         """Iterate over lines.
 
         Parameters
         ----------
         chunk_size : int | None
             Read chunk size.  Defaults to 8192.
+        limit : int | None
+            Maximum number of lines to yield. If None, yields all lines.
 
         Yields
         ------
@@ -88,7 +90,10 @@ class ArchiveMemberBody:
         if chunk_size is None:
             chunk_size = 8192
         buffer = b""
+        count = 0
         while True:
+            if limit is not None and count >= limit:
+                break
             chunk = self.read(chunk_size)
             if not chunk:
                 if buffer:
@@ -96,8 +101,11 @@ class ArchiveMemberBody:
                 break
             buffer += chunk
             while b"\n" in buffer:
+                if limit is not None and count >= limit:
+                    break
                 line, buffer = buffer.split(b"\n", 1)
                 yield line + b"\n"
+                count += 1
 
     def readinto(self, b: bytearray) -> int | None:
         """Read bytes into a buffer.
@@ -167,6 +175,8 @@ class Shard:
         self._store = store
         self._entry = entry
         self._cached_archive_data: bytes | None = None
+        self._cached_tar: tarfile.TarFile | None = None
+        self._cached_tar_buf: io.BytesIO | None = None
 
     @classmethod
     def from_key(cls, store: S3ExchangeStore, key: str) -> Shard:
@@ -240,6 +250,21 @@ class Shard:
         mode = Shard._determine_tar_mode(self.compression, read=True)
         return buf, mode
 
+    def _get_tar(self) -> tarfile.TarFile:
+        """Get or create a cached tarfile object for the shard.
+
+        Returns
+        -------
+        tarfile.TarFile
+            The opened tarfile object, cached for reuse.
+        """
+        if self._cached_tar is None:
+            data = self._get_archive_data()
+            self._cached_tar_buf = io.BytesIO(data)
+            mode = Shard._determine_tar_mode(self.compression, read=True)
+            self._cached_tar = tarfile.open(fileobj=self._cached_tar_buf, mode=mode)
+        return self._cached_tar
+
     # ------------------------------------------------------------------ #
     #  Instance methods                                                   #
     # ------------------------------------------------------------------ #
@@ -312,8 +337,13 @@ class Shard:
         except Exception as e:
             raise ShardReadError(f"Failed to read shard archive: {e}") from e
 
-    def iter_entries(self) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
+    def iter_entries(self, limit: int | None = None) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
         """Iterate over data files (excludes the internal manifest).
+
+        Parameters
+        ----------
+        limit : int | None
+            Maximum number of entries to yield. If None, yields all entries.
 
         Yields
         ------
@@ -332,7 +362,10 @@ class Shard:
                     if mp:
                         member_map[mp] = fe
 
+                count = 0
                 for member in tar:
+                    if limit is not None and count >= limit:
+                        break
                     if not member.isfile():
                         continue
                     if member.name == self.internal_manifest_path:
@@ -364,13 +397,19 @@ class Shard:
                         enriched["key"] = f"{self.archive_key}#{member.name}"
 
                     yield ArchiveMemberBody(io.BytesIO(member_data)), enriched
+                    count += 1
         except ShardReadError:
             raise
         except Exception as e:
             raise ShardReadError(f"Failed to iterate shard members: {e}") from e
 
-    def iter_objects(self) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
+    def iter_objects(self, limit: int | None = None) -> Iterator[tuple[ArchiveMemberBody, FileEntry]]:
         """Iterate over **all** archive members including the internal manifest.
+
+        Parameters
+        ----------
+        limit : int | None
+            Maximum number of objects to yield. If None, yields all objects.
 
         Yields
         ------
@@ -379,7 +418,10 @@ class Shard:
         buf, mode = self._open_tar()
         try:
             with tarfile.open(fileobj=buf, mode=mode) as tar:
+                count = 0
                 for member in tar:
+                    if limit is not None and count >= limit:
+                        break
                     if not member.isfile():
                         continue
                     member_file = tar.extractfile(member)
@@ -396,6 +438,7 @@ class Shard:
                         "size_bytes": member.size if hasattr(member, "size") else None,
                     }
                     yield ArchiveMemberBody(io.BytesIO(data)), entry
+                    count += 1
         except Exception as e:
             if isinstance(e, ShardReadError):
                 raise
@@ -420,24 +463,23 @@ class Shard:
         ShardReadError
             If extraction fails.
         """
-        buf, mode = self._open_tar()
+        tar = self._get_tar()
         try:
-            with tarfile.open(fileobj=buf, mode=mode) as tar:
-                try:
-                    member = tar.getmember(member_path)
-                except KeyError:
-                    raise ObjectNotFoundError(f"{member_path} not found in archive")
+            try:
+                member = tar.getmember(member_path)
+            except KeyError:
+                raise ObjectNotFoundError(f"{member_path} not found in archive")
 
-                if not member.isfile():
-                    raise ShardReadError(f"Member {member_path} is not a file")
+            if not member.isfile():
+                raise ShardReadError(f"Member {member_path} is not a file")
 
-                member_file = tar.extractfile(member)
-                if member_file is None:
-                    raise ShardReadError(f"Failed to extract member: {member_path}")
+            member_file = tar.extractfile(member)
+            if member_file is None:
+                raise ShardReadError(f"Failed to extract member: {member_path}")
 
-                data = member_file.read()
-                member_file.close()
-                return ArchiveMemberBody(io.BytesIO(data))
+            data = member_file.read()
+            member_file.close()
+            return ArchiveMemberBody(io.BytesIO(data))
         except (ShardReadError, ObjectNotFoundError):
             raise
         except Exception as e:

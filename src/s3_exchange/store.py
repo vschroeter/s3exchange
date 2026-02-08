@@ -388,6 +388,105 @@ class S3ExchangeStore:
         except ObjectNotFoundError:
             return False
 
+    def download_object(
+        self,
+        key: str,
+        local_path: Path | str,
+    ) -> Path:
+        """Download a single object from S3 to a local file path.
+
+        Parameters
+        ----------
+        key : str
+            S3 object key (or virtual key).
+        local_path : Path | str
+            Local file path where the object will be saved.
+
+        Returns
+        -------
+        Path
+            The local path where the file was saved.
+
+        Raises
+        ------
+        ObjectNotFoundError
+            If the object does not exist.
+        """
+        local_path = Path(local_path)
+        local_path.parent.mkdir(parents=True, exist_ok=True)
+
+        stream = self.get_object(key)
+        try:
+            with open(local_path, "wb") as f:
+                while True:
+                    chunk = stream.read(8192)
+                    if not chunk:
+                        break
+                    f.write(chunk)
+        finally:
+            stream.close()
+
+        return local_path
+
+    def download_objects(
+        self,
+        keys: Iterable[str],
+        local_dir: Path | str,
+    ) -> dict[str, Path]:
+        """Download multiple objects from a list of keys to a local directory.
+
+        Objects are saved using their key name (or member_path for virtual keys)
+        as the filename. If multiple objects would map to the same filename,
+        later objects will overwrite earlier ones.
+
+        Parameters
+        ----------
+        keys : Iterable[str]
+            S3 object keys (regular or virtual keys).
+        local_dir : Path | str
+            Local directory where objects will be saved.
+
+        Returns
+        -------
+        dict[str, Path]
+            Mapping from S3 key to local file path for each downloaded object.
+
+        Examples
+        --------
+        >>> store = S3ExchangeStore(...)
+        >>> keys = ["data/file1.txt", "shards/archive.tar.gz#member1.txt"]
+        >>> paths = store.download_objects(keys, "/tmp/downloads")
+        >>> # Files saved to: /tmp/downloads/file1.txt, /tmp/downloads/member1.txt
+        """
+        local_dir = Path(local_dir)
+        local_dir.mkdir(parents=True, exist_ok=True)
+
+        downloaded: dict[str, Path] = {}
+
+        for stream, entry in self.iter_objects_from_keys(keys):
+            # Determine filename from entry
+            if entry.get("member_path"):
+                # Virtual key - use member_path as filename
+                filename = Path(entry["member_path"]).name
+            else:
+                # Regular key - use key name as filename
+                key = entry["key"]
+                filename = Path(key).name
+
+            local_path = local_dir / filename
+            try:
+                with open(local_path, "wb") as f:
+                    while True:
+                        chunk = stream.read(8192)
+                        if not chunk:
+                            break
+                        f.write(chunk)
+                downloaded[entry["key"]] = local_path
+            finally:
+                stream.close()
+
+        return downloaded
+
     # ------------------------------------------------------------------ #
     #  Manifest convenience wrappers (delegate to Manifest)               #
     # ------------------------------------------------------------------ #
@@ -397,6 +496,7 @@ class S3ExchangeStore:
         manifest: ManifestRef,
         *,
         resolve_refs: bool = True,
+        limit: int | None = None,
     ) -> Iterator[ManifestEntry]:
         """Iterate over manifest entries.
 
@@ -408,19 +508,22 @@ class S3ExchangeStore:
             Key or iterable of entries.
         resolve_refs : bool
             Resolve ``manifest_ref`` entries recursively.
+        limit : int | None
+            Maximum number of entries to yield. If None, yields all entries.
 
         Yields
         ------
         ManifestEntry
         """
         m = Manifest.from_ref(self, manifest)
-        yield from m.iter_entries(resolve_refs=resolve_refs)
+        yield from m.iter_entries(resolve_refs=resolve_refs, limit=limit)
 
     def iter_objects(
         self,
         manifest: ManifestRef,
         *,
         expand_shards: bool = True,
+        limit: int | None = None,
     ) -> Iterator[tuple[StreamingBodyLike, ManifestEntry]]:
         """Iterate over objects in a manifest, yielding ``(stream, entry)`` pairs.
 
@@ -430,13 +533,15 @@ class S3ExchangeStore:
             Key or iterable of entries.
         expand_shards : bool
             Expand shard entries into individual streams.
+        limit : int | None
+            Maximum number of objects to yield. If None, yields all objects.
 
         Yields
         ------
         tuple[StreamingBodyLike, ManifestEntry]
         """
         m = Manifest.from_ref(self, manifest)
-        yield from m.iter_objects(expand_shards=expand_shards)
+        yield from m.iter_objects(expand_shards=expand_shards, limit=limit)
 
     def get_objects(
         self,
@@ -448,6 +553,8 @@ class S3ExchangeStore:
     def iter_objects_from_keys(
         self,
         keys: Iterable[str],
+        *,
+        limit: int | None = None,
     ) -> Iterator[tuple[StreamingBodyLike, FileEntry]]:
         """Iterate objects from a list of keys, optimizing shard access.
 
@@ -462,6 +569,8 @@ class S3ExchangeStore:
         ----------
         keys : Iterable[str]
             S3 object keys (regular or virtual keys).
+        limit : int | None
+            Maximum number of objects to yield. If None, yields all objects.
 
         Yields
         ------
@@ -481,6 +590,7 @@ class S3ExchangeStore:
         ...     # Archive is opened once, both members yielded together
         ...     print(entry["key"])
         """
+        count = 0
         # Separate regular keys from virtual keys
         regular_keys: list[str] = []
         virtual_by_archive: dict[str, list[str]] = defaultdict(list)
@@ -499,6 +609,8 @@ class S3ExchangeStore:
 
         # Process regular keys immediately
         for key in regular_keys:
+            if limit is not None and count >= limit:
+                return
             try:
                 stream = self.get_object(key, resolve_virtual_keys=False)
                 # Try to get metadata for a richer entry
@@ -520,12 +632,15 @@ class S3ExchangeStore:
                         "id": self.infer_id(key),
                     }
                 yield stream, entry
+                count += 1
             except ObjectNotFoundError:
                 # Skip missing keys
                 continue
 
         # Process virtual keys grouped by archive
         for archive_key, member_requests in virtual_by_archive.items():
+            if limit is not None and count >= limit:
+                return
             try:
                 shard = self.get_shard(archive_key)
                 # Get the internal manifest to enrich entries
@@ -543,6 +658,8 @@ class S3ExchangeStore:
 
                 # Yield all requested members from this shard
                 for virtual_key, member_path in member_requests:
+                    if limit is not None and count >= limit:
+                        return
                     try:
                         stream = shard.get_member(member_path)
                         # Use manifest entry if available, otherwise create minimal entry
@@ -563,6 +680,7 @@ class S3ExchangeStore:
                                 "id": self.infer_id(member_path),
                             }
                         yield stream, entry
+                        count += 1
                     except ObjectNotFoundError:
                         # Skip missing members
                         continue
