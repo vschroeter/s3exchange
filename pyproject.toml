@@ -1,6 +1,6 @@
 [project]
 name = "s3exchange"
-version = "0.1.0"
+version = "0.1.1"
 description = "Library for managing data exchange with manifests and shards via S3."
 readme = "README.md"
 authors = [

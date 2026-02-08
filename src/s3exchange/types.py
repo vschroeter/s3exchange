@@ -1,11 +1,11 @@
-"""Type definitions for s3-exchange."""
+"""Type definitions for s3exchange."""
 
 from __future__ import annotations
 
+from collections.abc import Iterable, Iterator, Sequence
 from dataclasses import dataclass
-from typing import Any, Literal, Protocol, TypedDict, Union
 from pathlib import Path
-from collections.abc import Iterator, Iterable, Sequence
+from typing import Any, Literal, Protocol, TypedDict, Union
 
 from botocore.response import StreamingBody
 
@@ -13,6 +13,7 @@ from botocore.response import StreamingBody
 # Manifest entry types
 class FileEntry(TypedDict, total=False):
     """Entry for a single S3 object (loose file)."""
+
     kind: str  # "file"
     key: str
     id: str | None
@@ -24,6 +25,7 @@ class FileEntry(TypedDict, total=False):
 
 class ShardEntry(TypedDict, total=False):
     """Entry for a shard archive object."""
+
     kind: str  # "shard"
     archive_key: str
     format: str  # "tar"
@@ -36,6 +38,7 @@ class ShardEntry(TypedDict, total=False):
 
 class ManifestRefEntry(TypedDict):
     """Entry referencing another manifest file."""
+
     kind: str  # "manifest_ref"
     key: str
 
@@ -49,6 +52,7 @@ ManifestRef = Union[str, Iterable[ManifestEntry]]
 # Shard item for building shards
 class ShardItem(TypedDict, total=False):
     """Item to be included in a shard archive."""
+
     source: bytes | Path | str  # data source: bytes, file path, or S3 key
     member_path: str  # path inside the archive
     id: str | None
@@ -60,13 +64,14 @@ class ShardItem(TypedDict, total=False):
 @dataclass
 class ShardSizePolicy:
     """Policy for shard size limits.
-    
+
     At least one of max_entries or max_bytes must be set.
     Both can be set to enforce both limits.
     """
+
     max_entries: int | None = None
     max_bytes: int | None = None
-    
+
     def __post_init__(self) -> None:
         """Validate that at least one limit is set."""
         if self.max_entries is None and self.max_bytes is None:
@@ -76,6 +81,7 @@ class ShardSizePolicy:
 # Manifest writer configuration
 class ManifestWriterConfig(TypedDict, total=False):
     """Configuration for ManifestWriter."""
+
     mode: Literal["overwrite", "append_parts"]  # default: "append_parts"
     part_max_entries: int  # default: 50_000
     part_max_bytes: int  # default: 50 * 1024 * 1024
@@ -86,6 +92,7 @@ class ManifestWriterConfig(TypedDict, total=False):
 # StreamingBody-like protocol
 class StreamingBodyLike(Protocol):
     """Protocol for file-like objects compatible with StreamingBody."""
+
     def read(self, amt: int | None = None) -> bytes: ...
     def close(self) -> None: ...
     def iter_lines(self, chunk_size: int | None = None, limit: int | None = None) -> Iterator[bytes]: ...
@@ -95,6 +102,7 @@ class StreamingBodyLike(Protocol):
 # Delete report
 class DeleteReport(TypedDict, total=False):
     """Report from delete operations."""
+
     deleted_object_count: int
     deleted_archive_count: int
     deleted_manifest_count: int
@@ -104,6 +112,7 @@ class DeleteReport(TypedDict, total=False):
 # Compact report
 class CompactReport(TypedDict, total=False):
     """Report from manifest compaction."""
+
     total_entries: int
     removed_entries: int
     resolved_refs: int

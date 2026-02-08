@@ -1,11 +1,11 @@
-# s3-exchange
+# s3exchange
 
 A Python library for service-wise namespace management of S3 artifacts with manifest-based data exchange, supporting both loose objects and shard archives.
 
 ## Installation
 
 ```bash
-uv add s3-exchange
+uv add s3exchange
 ```
 
 ## Quick Start

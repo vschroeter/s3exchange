@@ -590,7 +590,7 @@ wheels = [
 ]
 
 [[package]]
-name = "s3-exchange"
+name = "s3exchange"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
