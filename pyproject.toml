@@ -1,7 +1,7 @@
 [project]
-name = "s3-exchange"
+name = "s3exchange"
 version = "0.1.0"
-description = "Add your description here"
+description = "Library for managing data exchange with manifests and shards via S3."
 readme = "README.md"
 authors = [
     { name = "Valentin Schröter Bonk", email = "vasc9380@th-wildau.de" }

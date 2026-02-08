@@ -12,7 +12,7 @@ uv add s3-exchange
 
 ```python
 import boto3
-from s3_exchange import S3ExchangeStore
+from s3exchange import S3ExchangeStore
 
 # Initialize store
 s3_client = boto3.client('s3', endpoint_url='http://garage:3900')
@@ -26,22 +26,7 @@ store = S3ExchangeStore(
 
 ## Key Features
 
-### 1. Key Templating and Scoping
-
-Use placeholders in key templates and resolve them with variables:
-
-```python
-# Resolve template with variables
-key = store._resolve_key("training/{job_id}/samples", {"job_id": "123"})
-# Returns: "prod/training/123/samples"
-
-# Create a scoped store for convenience
-scoped = store.scope(job_id="123", prefix="training")
-key = scoped.key("{prefix}/{job_id}/samples")
-# Returns: "prod/training/123/samples"
-```
-
-### 2. Reading Objects
+### Reading Objects
 
 #### Read a single object:
 ```python
@@ -66,7 +51,7 @@ for entry in store.iter_manifest_entries("training/123/samples/manifest.jsonl"):
     print(f"Entry: {entry['kind']}, Key: {entry.get('key', entry.get('archive_key'))}")
 ```
 
-### 3. Writing Objects
+### Writing Objects
 
 #### Put a single object:
 ```python
@@ -89,7 +74,7 @@ entry = store.put_object(
 )
 ```
 
-### 4. Writing Manifests
+### Writing Manifests
 
 #### Overwrite mode (simple):
 ```python
@@ -117,13 +102,13 @@ store.write_manifest(
 )
 ```
 
-### 5. Shard Archives
+### Shard Archives
 
 Shard archives are tar/tar.gz files containing multiple files with an internal manifest.
 
 #### Create and upload shards:
 ```python
-from s3_exchange import create_shards
+from s3exchange import Shard
 
 # Prepare items for sharding
 items = [
@@ -145,7 +130,7 @@ items = [
 ]
 
 # Split into shards (max 10000 entries or 1GB per shard)
-shard_batches = create_shards(
+shard_batches = Shard.split_items(
     items,
     max_entries=10000,
     max_bytes=1024 * 1024 * 1024,  # 1 GB
@@ -155,13 +140,13 @@ shard_batches = create_shards(
 shard_entries = []
 for i, batch in enumerate(shard_batches):
     archive_key = f"training/123/samples/shards/shard-{i:05d}.tar.gz"
-    shard_entry = store.put_shard_archive(
+    shard = store.put_shard_archive(
         archive_key=archive_key,
         shard_items=batch,
         format="tar",
         compression="gzip",
     )
-    shard_entries.append(shard_entry)
+    shard_entries.append(shard.entry)  # Extract ShardEntry from Shard object
 
 # Write shard entries to manifest
 store.put_sharded(
@@ -184,7 +169,7 @@ for stream, entry in store.iter_objects("training/123/samples/manifest.jsonl"):
     stream.close()
 ```
 
-### 6. Deletion Operations
+### Deletion Operations
 
 #### Delete a single object:
 ```python
@@ -214,7 +199,7 @@ print(f"Deleted {report['deleted_archive_count']} archives")
 print(f"Deleted {report['deleted_manifest_count']} manifests")
 ```
 
-### 7. Listing Operations
+### Listing Operations
 
 #### List S3 keys:
 ```python
@@ -242,7 +227,7 @@ for entry in store.list_by_manifest_prefix(
     print(entry['key'])
 ```
 
-### 8. Manifest Compaction
+### Manifest Compaction
 
 Flatten a manifest with many parts into a single clean manifest:
 
@@ -280,7 +265,7 @@ Manifests are JSONL files (one JSON object per line):
 The library provides domain-specific exceptions:
 
 ```python
-from s3_exchange import (
+from s3exchange import (
     ObjectNotFoundError,
     ManifestNotFoundError,
     MissingPlaceholderError,
@@ -304,7 +289,7 @@ except MissingPlaceholderError as e:
 The library is fully typed with Python 3.12 type annotations. All types are available for import:
 
 ```python
-from s3_exchange import (
+from s3exchange import (
     ManifestEntry,
     FileEntry,
     ShardEntry,

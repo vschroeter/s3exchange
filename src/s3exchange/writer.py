@@ -8,8 +8,8 @@ import tempfile
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, BinaryIO, Literal
 
-from s3_exchange.manifest import Manifest
-from s3_exchange.types import (
+from s3exchange.manifest import Manifest
+from s3exchange.types import (
     FileEntry,
     ManifestEntry,
     ManifestRefEntry,
@@ -19,7 +19,7 @@ from s3_exchange.types import (
 )
 
 if TYPE_CHECKING:
-    from s3_exchange.store import S3ExchangeStore
+    from s3exchange.store import S3ExchangeStore
 
 
 class ManifestWriter:

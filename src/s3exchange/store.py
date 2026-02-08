@@ -10,7 +10,7 @@ from typing import TYPE_CHECKING, Any, Callable, Literal
 
 from botocore.client import BaseClient
 
-from s3_exchange.settings import S3Settings
+from s3exchange.settings import S3Settings
 
 if TYPE_CHECKING:
     import boto3
@@ -222,13 +222,7 @@ class S3ExchangeStore:
         -------
         bool
         """
-        return (
-            key.endswith(".tar")
-            or key.endswith(".tar.gz")
-            or key.endswith(".tgz")
-            or key.endswith(".tar.bz2")
-            or key.endswith(".tar.xz")
-        )
+        return key.endswith(".tar") or key.endswith(".tar.gz") or key.endswith(".tgz") or key.endswith(".tar.bz2") or key.endswith(".tar.xz")
 
     # ------------------------------------------------------------------ #
     #  Object-oriented accessors                                          #
@@ -307,7 +301,8 @@ class S3ExchangeStore:
                 archive_key, member_path = parts
                 try:
                     archive_stream = self.get_object(
-                        archive_key, resolve_virtual_keys=False,
+                        archive_key,
+                        resolve_virtual_keys=False,
                     )
                 except ObjectNotFoundError:
                     pass  # fall through to regular lookup
@@ -778,7 +773,10 @@ class S3ExchangeStore:
             if content_type:
                 extra_args["ContentType"] = content_type
             self.s3_client.put_object(
-                Bucket=self.bucket, Key=key, Body=data, **extra_args,
+                Bucket=self.bucket,
+                Key=key,
+                Body=data,
+                **extra_args,
             )
             size_bytes = len(data)
             head = self.get_object_metadata(key)
@@ -788,7 +786,10 @@ class S3ExchangeStore:
             if content_type:
                 extra_args["ContentType"] = content_type
             self.s3_client.upload_fileobj(
-                data, self.bucket, key, ExtraArgs=extra_args,
+                data,
+                self.bucket,
+                key,
+                ExtraArgs=extra_args,
             )
             head = self.get_object_metadata(key)
             size_bytes = head.get("ContentLength")
@@ -868,12 +869,16 @@ class S3ExchangeStore:
         try:
             if isinstance(archive_data_or_path, Path):
                 self.s3_client.upload_file(
-                    str(archive_data_or_path), self.bucket, archive_key,
+                    str(archive_data_or_path),
+                    self.bucket,
+                    archive_key,
                 )
                 archive_data_or_path.unlink()
             else:
                 self.s3_client.put_object(
-                    Bucket=self.bucket, Key=archive_key, Body=archive_data_or_path,
+                    Bucket=self.bucket,
+                    Key=archive_key,
+                    Body=archive_data_or_path,
                 )
         except Exception:
             if isinstance(archive_data_or_path, Path) and archive_data_or_path.exists():
@@ -1034,7 +1039,8 @@ class S3ExchangeStore:
                 keys_to_delete = keys_to_delete[batch_size:]
                 if batch:
                     self.s3_client.delete_objects(
-                        Bucket=self.bucket, Delete={"Objects": batch},
+                        Bucket=self.bucket,
+                        Delete={"Objects": batch},
                     )
                     deleted_count += len(batch)
 
